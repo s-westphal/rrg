@@ -49,6 +49,8 @@ pub enum Action {
     ListWinregKeys,
     /// Query WMI using WQL (Windows-only).
     QueryWmi,
+    /// Execute a signed command.
+    ExecuteSignedCommand,
 }
 
 impl std::fmt::Display for Action {
@@ -72,6 +74,7 @@ impl std::fmt::Display for Action {
             Action::ListWinregValues => write!(fmt, "list_winreg_values"),
             Action::ListWinregKeys => write!(fmt, "list_winreg_keys"),
             Action::QueryWmi => write!(fmt, "query_wmi"),
+            Action::ExecuteSignedCommand => write!(fmt, "execute_signed_command"),
         }
     }
 }
@@ -121,6 +124,7 @@ impl TryFrom<rrg_proto::rrg::Action> for Action {
             LIST_WINREG_VALUES => Ok(Action::ListWinregValues),
             LIST_WINREG_KEYS => Ok(Action::ListWinregKeys),
             QUERY_WMI => Ok(Action::QueryWmi),
+            EXECUTE_SIGNED_COMMAND => Ok(Action::ExecuteSignedCommand),
             _ => {
                 let value = protobuf::Enum::value(&proto);
                 Err(UnknownAction { value })
