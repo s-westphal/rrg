@@ -38,4 +38,4 @@ jobs:
         with:
           command: test
           args: >
-            --features 'test-chattr test-setfattr test-fuse'
+            --features 'test-chattr test-setfattr test-fuse rand_core'

@@ -3,14 +3,13 @@
 // Use of this source code is governed by an MIT-style license that can be found
 // in the LICENSE file or at https://opensource.org/licenses/MIT.
 
-use std::{io::{Read, Write}, os::{unix::process::ExitStatusExt}, process::{Command, ExitStatus}};
+use std::{io::{Read, Write}, os::unix::process::ExitStatusExt, process::{Command, ExitStatus}};
 
 use protobuf::Message;
 
-use crate::request::ParseArgsError;
-
 // TODO(swestphal): Check and update max size.
 const MAX_OUTPUT_SIZE: usize = 2048;
+const COMMAND_EXECUTION_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Arguments of the `execute_signed_command` action.
 pub struct Args {
@@ -43,100 +42,94 @@ enum Stdin {
 }
 
 
-fn verify_ed25519_signature(data: &Vec<u8>, ed25519_signature: &ed25519_dalek::Signature) -> Result<(), ed25519_dalek::SignatureError>
-{   
-    // TODO(swestphal): Load public key from config.
-    let public_key_bytes: [u8; ed25519_dalek::PUBLIC_KEY_LENGTH] = [
-        215,  90, 152,   1, 130, 177,  10, 183, 213,  75, 254, 211, 201, 100,   7,  58,
-        14, 225, 114, 243, 218, 166,  35,  37, 175,   2,  26, 104, 247,   7,   81, 26];
-    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&public_key_bytes).unwrap();
-
-    verifying_key.verify_strict(data, ed25519_signature)
-}
-
 /// Handles invocations of the `execute_signed_command` action.
 pub fn handle<S>(session: &mut S, mut args: Args) -> crate::session::Result<()>
 where
     S: crate::session::Session,
 {
-    verify_ed25519_signature(&args.raw_command, &args.ed25519_signature)
+    match session.args().command_verification_key {
+        Some(key) => key.verify_strict(&args.raw_command, &args.ed25519_signature)
+            .map_err(crate::session::Error::action)?,
+        None => panic!("missing verification key for signed command"),
+    };
+    
+    let command_path = &std::path::PathBuf::try_from(args.command.take_path())
         .map_err(crate::session::Error::action)?;
-
-
-    let command_path = &std::path::PathBuf::try_from(args.command.take_path()).unwrap();
 
     let mut command_process = Command::new(command_path)
         .stdin(std::process::Stdio::piped())
         .args(args.command.take_args())
+        .env_clear()
         .envs(args.command.take_env())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(crate::session::Error::action)?;
-
     
-    let mut command_stdin = command_process.stdin.take().unwrap();
-    if let Stdin::SIGNED(stdin) = args.stdin {
-        let _ = command_stdin.write(&stdin[..])
-            .map_err(crate::session::Error::action);
-    }
-    else if let Stdin::UNSIGNED(stdin) = args.stdin {
-        let _ = command_stdin.write(&stdin[..])
-            .map_err(crate::session::Error::action);
-    }
+    let command_start_time = std::time::SystemTime::now();
+    
+    let mut command_stdin = match command_process.stdin.take() {
+        Some(command_stdin) => command_stdin,
+        None => panic!("command stdin pipe should not be None")
+    };
+    let handle = std::thread::spawn(move || {
+        match args.stdin {
+            Stdin::SIGNED(signed) => command_stdin.write(&signed[..]).expect("Failed to write to stdin"),
+            Stdin::UNSIGNED(unsigned) => command_stdin.write(&unsigned[..]).expect("Failed to write to stdin"),
+            Stdin::NONE => 0,
+        };
+    });
+    // TODO(swestphal): join returns a `Box<dyn std::any::Any + Send>`
+    // error which cannot be passed to crate:session:Error::action.
+    let _ = handle.join().unwrap();
 
-    let start = std::time::SystemTime::now();
-    while std::time::SystemTime::now().duration_since(start).unwrap() < args.timeout {
+    while std::time::SystemTime::now().duration_since(command_start_time).unwrap() < args.timeout {
         match command_process.try_wait() {
             Ok(None) => {
-                dbg!("command not ready yet, wait");
+                log::debug!("command not completed, waiting {:?}", COMMAND_EXECUTION_CHECK_INTERVAL);
+                std::thread::sleep(COMMAND_EXECUTION_CHECK_INTERVAL);
             }
             _ => break,
         }
     }
     // Either the process has exited, then kill doesn't do anything,
     // or we kill the process.
-    command_process.kill().map_err(crate::session::Error::action);
+    command_process.kill().map_err(crate::session::Error::action)?;
 
     let exit_status = command_process.wait()
         .map_err(crate::session::Error::action)?;
 
 
     let mut stdout = Vec::<u8>::new();
-    let read_result = match command_process.stdout.take() {
-        Some(mut process_stdout) => process_stdout.read_to_end(&mut stdout),
-        None => Ok(0),
+    let length_stdout = match command_process.stdout.take() {
+        Some(mut process_stdout) => {
+            process_stdout.read_to_end(&mut stdout).map_err(crate::session::Error::action)?
+        }
+        None => 0,
     };
-    let length = read_result.unwrap();
-    
-    let truncate_stdout = length > MAX_OUTPUT_SIZE;
-    if truncate_stdout {
-        let mut truncated = Vec::<u8>::new();
-        truncated.clone_from_slice(&stdout[..MAX_OUTPUT_SIZE]);
-        stdout = truncated;
+    let truncated_stdout = length_stdout > MAX_OUTPUT_SIZE;
+    if truncated_stdout {
+        stdout.truncate(MAX_OUTPUT_SIZE);
     };
 
     let mut stderr = Vec::<u8>::new();
-    let read_result = match command_process.stderr.take() {
-        Some(mut process_stderr) => process_stderr.read_to_end(&mut stderr),
-        None => Ok(0),
+    let length_stderr = match command_process.stderr.take() {
+        Some(mut process_stderr) => {
+            process_stderr.read_to_end(&mut stderr).map_err(crate::session::Error::action)?
+        }
+        None => 0,
     };
-    let length_stderr = read_result.map_err(crate::session::Error::action)?;
-    
-    let truncate_stderr = length_stderr > MAX_OUTPUT_SIZE;
-    if truncate_stderr {
-        let mut truncated = Vec::<u8>::new();
-        truncated.clone_from_slice(&stderr[..MAX_OUTPUT_SIZE]);
-        stderr = truncated;
+    let truncated_stderr = length_stderr > MAX_OUTPUT_SIZE;
+    if truncated_stderr {
+        stderr.truncate(MAX_OUTPUT_SIZE);
     };
-
 
     session.reply(Item{
-        exit_status: exit_status,
-        stdout: stdout.to_owned(),
-        truncated_stdout: truncate_stdout,
-        stderr: stderr.to_owned(),
-        truncated_stderr: truncate_stderr,
+        exit_status,
+        stdout,
+        stderr,
+        truncated_stdout,
+        truncated_stderr,
     })?;
     
     Ok(())
@@ -148,15 +141,12 @@ impl crate::request::Args for Args {
     type Proto = rrg_proto::execute_signed_command::Args;
 
     fn from_proto(mut proto: Self::Proto) -> Result<Args, crate::request::ParseArgsError> {
+        use crate::request::ParseArgsError;
+
         let raw_signature= proto.take_command_ed25519_signature();
 
-        let signature_bytes = match raw_signature.len() {
-            ed25519_dalek::SIGNATURE_LENGTH => <&[u8; 64]>::try_from(&raw_signature[0..ed25519_dalek::SIGNATURE_LENGTH])
-                .map_err(|error| ParseArgsError::invalid_field("command_ed25519_signature", error))?,
-            len => return Err(ParseArgsError::invalid_field("command_ed25519_signature", SignatureFormatError {
-                  len,
-                })),
-        };
+        let ed25519_signature = ed25519_dalek::Signature::try_from(&raw_signature[..])
+            .map_err(|error| ParseArgsError::invalid_field("command_ed25519_signature", error))?;
 
         let raw_command = proto.take_command();
         let mut command = rrg_proto::execute_signed_command::SignedCommand::parse_from_bytes(&raw_command)
@@ -178,14 +168,12 @@ impl crate::request::Args for Args {
         Ok(Args {
             raw_command,
             command,
-            ed25519_signature: ed25519_dalek::Signature::from_bytes(signature_bytes),
+            ed25519_signature,
             stdin,
             timeout,
         })
     }
 }
-
-
 
 
 impl crate::response::Item for Item {
@@ -217,53 +205,234 @@ impl crate::response::Item for Item {
     }
 }
 
-#[derive(Debug)]
-struct SignatureFormatError {
-    len: usize,
-}
-
-impl std::fmt::Display for SignatureFormatError {
-
-    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write! {
-            fmt,
-            "provided signature length ({}) does not match the expected length ({})",
-            self.len, ed25519_dalek::SIGNATURE_LENGTH
-        }
-    }
-}
-
-impl std::error::Error for SignatureFormatError {
-}
 
 #[cfg(test)]
 mod tests {
 
-    use protobuf::SpecialFields;
+    use std::path::PathBuf;
+
+    use ed25519_dalek::{Signer, VerifyingKey};
+
+    use crate::session::FakeSession;
 
     use super::*;
 
-    // TODO(swestphal): write actually useful tests.
-    #[test]
-    fn test_parse_command() {
-        let command = rrg_proto::execute_signed_command::SignedCommand::default().write_to_bytes().unwrap();
-        let unsigned_stdin = Vec::from([1, 2, 3, 4]);
-        let signature_bytes: [u8; 64] = [
-            215,  90, 152,   1, 130, 177,  10, 183, 213,  75, 254, 211, 201, 100,   7,  58,
-            14, 225, 114, 243, 218, 166,  35,  37, 175,   2,  26, 104, 247,   7,   81, 26,
-            215,  90, 152,   1, 130, 177,  10, 183, 213,  75, 254, 211, 201, 100,   7,  58,
-            14, 225, 114, 243, 218, 166,  35,  37, 175,   2,  26, 104, 247,   7,   81, 26];
-        let command_ed25519_signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-        let args = Args {
-            command,
-            unsigned_stdin,
-            command_ed25519_signature,
-            timeout: Duration { seconds: 10, nanos: 0, special_fields: SpecialFields::default() }
-        };
-
-        let mut session = crate::session::FakeSession::new();
-        handle(&mut session, args)
-            .unwrap();
+    fn prepare_session(verification_key: VerifyingKey) -> FakeSession {
+        crate::session::FakeSession::with_args(crate::args::Args {
+            heartbeat_rate: std::time::Duration::from_secs(0),
+            command_verification_key: Some(verification_key),
+            verbosity: log::LevelFilter::Debug,
+            log_to_stdout: false,
+            log_to_file: None,
+        })
     }
 
+    #[test]
+    fn test_args() {
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut session = prepare_session(signing_key.verifying_key());
+
+        let mut command = rrg_proto::execute_signed_command::SignedCommand::new();
+        command.set_path(rrg_proto::fs::Path::try_from(PathBuf::from("echo")).unwrap());
+        command.args.push(String::from("Hello,"));
+        command.args.push(String::from("world!"));
+        let raw_command = command.write_to_bytes().unwrap();
+
+        let ed25519_signature = signing_key.sign(&raw_command);
+    
+        let args = Args {
+            raw_command,
+            command,
+            ed25519_signature,
+            stdin: Stdin::NONE,
+            timeout: std::time::Duration::from_secs(5),
+        };
+
+        handle(&mut session, args).unwrap();
+        let item = session.reply::<Item>(0);
+
+        assert_eq!(item.truncated_stdout, false);
+        assert_eq!(item.truncated_stderr, false);
+        assert_eq!(item.stderr.is_empty(), true);
+        assert_eq!(String::from_utf8_lossy(&item.stdout), "Hello, world!\n");
+        assert_eq!(item.exit_status.success(), true)
+    }
+
+    #[test]
+    fn test_stdin() {
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut session = prepare_session(signing_key.verifying_key());
+
+        let mut command = rrg_proto::execute_signed_command::SignedCommand::new();
+        command.set_path(rrg_proto::fs::Path::try_from(PathBuf::from("cat")).unwrap());
+        let raw_command = command.write_to_bytes().unwrap();
+
+        let ed25519_signature = signing_key.sign(&raw_command);
+    
+        let args = Args {
+            raw_command,
+            command,
+            ed25519_signature,
+            stdin: Stdin::UNSIGNED(Vec::<u8>::from("Hello, world!")),
+            timeout: std::time::Duration::from_secs(5),
+        };
+
+        handle(&mut session, args).unwrap();
+        let item = session.reply::<Item>(0);
+
+        assert_eq!(item.truncated_stdout, false);
+        assert_eq!(item.truncated_stderr, false);
+        assert_eq!(item.stderr.is_empty(), true);
+        assert_eq!(String::from_utf8_lossy(&item.stdout), "Hello, world!");
+        assert_eq!(item.exit_status.success(), true)
+    }
+    #[test]
+    fn test_env() {
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut session = prepare_session(signing_key.verifying_key());
+
+        let mut command = rrg_proto::execute_signed_command::SignedCommand::new();
+        command.set_path(rrg_proto::fs::Path::try_from(PathBuf::from("printenv"),).unwrap());
+        command.env.insert(String::from("MY_ENV_VAR"), String::from("Hello, world!"));
+    
+        let raw_command = command.write_to_bytes().unwrap();
+        let ed25519_signature = signing_key.sign(&raw_command);
+    
+        let args = Args {
+            raw_command,
+            command,
+            ed25519_signature,
+            stdin: Stdin::NONE,
+            timeout: std::time::Duration::from_secs(5),
+        };
+
+        handle(&mut session, args).unwrap();
+        let item = session.reply::<Item>(0);
+
+        assert_eq!(item.truncated_stdout, false);
+        assert_eq!(item.truncated_stderr, false);
+        assert_eq!(item.stderr.is_empty(), true);
+        assert_eq!(String::from_utf8_lossy(&item.stdout), "MY_ENV_VAR=Hello, world!\n");
+        assert_eq!(item.exit_status.success(), true);
+    }
+
+    #[test]
+    fn test_unsigned_stdin() {
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut session = prepare_session(signing_key.verifying_key());
+
+        let mut command = rrg_proto::execute_signed_command::SignedCommand::new();
+        command.set_path(rrg_proto::fs::Path::try_from(PathBuf::from("cat")).unwrap());
+        command.set_unsigned_stdin(true);
+    
+        let raw_command = command.write_to_bytes().unwrap();
+        let ed25519_signature = signing_key.sign(&raw_command);
+    
+        let unsigned_stdin = Stdin::UNSIGNED(Vec::<u8>::from("Hello, world!"));
+
+        let args = Args {
+            raw_command,
+            command,
+            ed25519_signature,
+            stdin: unsigned_stdin,
+            timeout: std::time::Duration::from_secs(5),
+        };
+
+        handle(&mut session, args).unwrap();
+        let item = session.reply::<Item>(0);
+
+        assert_eq!(item.truncated_stdout, false);
+        assert_eq!(item.truncated_stderr, false);
+        assert_eq!(item.stderr.is_empty(), true);
+        assert_eq!(item.stdout, "Hello, world!".as_bytes());
+        assert_eq!(item.exit_status.success(), true);
+    }   
+
+    #[test]
+    fn test_invalid_signature() {
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut session = prepare_session(signing_key.verifying_key());
+
+        let mut command = rrg_proto::execute_signed_command::SignedCommand::new();
+        command.set_path(rrg_proto::fs::Path::try_from(PathBuf::from("echo \"Hello, world\"")).unwrap());
+        let raw_command = command.write_to_bytes().unwrap();
+
+        let invalid_signature_bytes: [u8; 64] = [0; 64];
+        let invalid_signature = ed25519_dalek::Signature::from_bytes(&invalid_signature_bytes);
+    
+        let args = Args {
+            raw_command,
+            command,
+            ed25519_signature: invalid_signature,
+            stdin: Stdin::NONE,
+            timeout: std::time::Duration::from_secs(5),
+        };
+
+        let _ = handle(&mut session, args).is_err();
+    }
+
+    #[test]
+    fn test_truncated_output() {
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut session = prepare_session(signing_key.verifying_key());
+
+        let mut command = rrg_proto::execute_signed_command::SignedCommand::new();
+        command.set_path(rrg_proto::fs::Path::try_from(PathBuf::from("echo")).unwrap());
+        command.args.push("A".repeat(MAX_OUTPUT_SIZE) + "|truncated");
+    
+        let raw_command = command.write_to_bytes().unwrap();
+        let ed25519_signature = signing_key.sign(&raw_command);
+    
+        let args = Args {
+            raw_command,
+            command,
+            ed25519_signature,
+            stdin: Stdin::NONE,
+            timeout: std::time::Duration::from_secs(5),
+        };
+
+        handle(&mut session, args).unwrap();
+        let item = session.reply::<Item>(0);
+
+        assert_eq!(item.truncated_stdout, true);
+        assert_eq!(item.truncated_stderr, false);
+        assert_eq!(item.stderr.is_empty(), true);
+        assert_eq!(String::from_utf8_lossy(&item.stdout), "A".repeat(MAX_OUTPUT_SIZE));
+        assert_eq!(item.exit_status.success(), true);
+    }
+    
+    #[test]
+    fn test_timeout() {
+        let timeout = std::time::Duration::from_secs(5);
+
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut session = prepare_session(signing_key.verifying_key());
+
+        let mut command = rrg_proto::execute_signed_command::SignedCommand::new();
+        command.set_path(rrg_proto::fs::Path::try_from(PathBuf::from("sleep")).unwrap());
+        command.args.push((timeout.as_secs() + 1).to_string());
+    
+        let raw_command = command.write_to_bytes().unwrap();
+        let ed25519_signature = signing_key.sign(&raw_command);
+    
+        let unsigned_stdin = Stdin::UNSIGNED(Vec::<u8>::from("Hello, world!"));
+
+        let args = Args {
+            raw_command,
+            command,
+            ed25519_signature,
+            stdin: unsigned_stdin,
+            timeout,
+        };
+
+        handle(&mut session, args).unwrap();
+        let item = session.reply::<Item>(0);
+
+        assert_eq!(item.truncated_stdout, false);
+        assert_eq!(item.truncated_stderr, false);
+        assert_eq!(item.stderr.is_empty(), true);
+        assert_eq!(item.stdout.is_empty(), true);
+        assert_eq!(item.exit_status.success(), false);
+        assert_eq!(item.exit_status.signal(), Some(9)); // killed
+    }
 }

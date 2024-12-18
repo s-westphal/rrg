@@ -46,8 +46,11 @@ test-setfattr = []
 test-chattr = []
 test-fuse = ["dep:fuse"]
 
-[dependencies]
-ed25519-dalek = "2.1.1"
+[dependencies.ed25519-dalek]
+version = "2.1.1"
+features = [
+    "rand_core",
+]
 
 [dependencies.ospect]
 path = "../ospect"
